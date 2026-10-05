@@ -1,0 +1,335 @@
+# Hands-On Lab: Backups, Point-in-Time Recovery, and Replication
+
+## Description
+
+### Objective
+
+The objective of this lab is to take a logical backup, configure WAL archiving, perform Point-in-Time Recovery (PITR) after a simulated disaster, and set up a streaming standby replica.
+
+## What You Will Do
+
+- Create and verify a logical backup.
+- Configure WAL archiving and take a base backup.
+- Recover a database to an exact point in time.
+- Build and monitor a streaming replication standby.
+
+## Instructions
+
+- Read each command carefully before running it.
+- Perform the steps in the given order.
+- Treat this lab as both a prevention and recovery exercise.
+
+---
+
+# Step 1: Take and Verify a Logical Backup
+
+First, I created a directory to store the database backups:
+
+```bash
+mkdir -p ~/backups
+```
+
+I then created a logical backup of the `bootcamp` database:
+
+```bash
+pg_dump -Fc -f ~/backups/bootcamp.dump bootcamp
+```
+
+I verified the contents of the backup:
+
+```bash
+pg_restore --list ~/backups/bootcamp.dump | head
+```
+
+I created a test database and restored the backup into it:
+
+```bash
+createdb bootcamp_check && pg_restore -d bootcamp_check ~/backups/bootcamp.dump
+```
+
+The commands above confirm that the `bootcamp` database can be backed up and restored successfully.
+
+---
+
+# Step 2: Enable WAL Archiving
+
+WAL stands for **Write-Ahead Logging**. PostgreSQL records database changes in WAL files.
+
+WAL archiving is required for Point-in-Time Recovery because PostgreSQL can replay archived WAL files to restore the database to a specific point in time.
+
+I created the directory for WAL files:
+
+```bash
+mkdir -p ~/backups/wal
+```
+
+I then configured the following settings in `postgresql.conf`:
+
+```conf
+wal_level = replica
+archive_mode = on
+archive_command = 'cp %p /home/$USER/backups/wal/%f'
+```
+
+After changing the PostgreSQL configuration, I restarted PostgreSQL:
+
+```bash
+sudo systemctl restart postgresql
+```
+
+I then created a base backup:
+
+```bash
+pg_basebackup -D ~/backups/base -Ft -z -Xs -P
+```
+
+The base backup provides a complete starting point that can be combined with WAL files during recovery.
+
+---
+
+# Step 3: Simulate a Disaster and Recover
+
+First, I connected to the `bootcamp` database:
+
+```bash
+psql bootcamp
+```
+
+I recorded the current database time:
+
+```sql
+SELECT now();
+```
+
+Example:
+
+```text
+2025-06-01 10:00:00
+```
+
+I recorded this time because it can be used as the recovery target.
+
+I then simulated an accidental deletion:
+
+```sql
+DELETE FROM students;
+```
+
+I could verify that the data had been deleted using:
+
+```sql
+SELECT count(*) FROM students;
+```
+
+## Recovery Process
+
+### 1. Stop PostgreSQL
+
+```bash
+sudo systemctl stop postgresql
+```
+
+### 2. Restore the Base Backup
+
+I replaced the PostgreSQL data directory with the restored base backup.
+
+The exact PostgreSQL data directory depends on the operating system and PostgreSQL version.
+
+### 3. Configure Recovery
+
+In `postgresql.conf`, I configured:
+
+```conf
+restore_command = 'cp /home/$USER/backups/wal/%f %p'
+recovery_target_time = '2025-06-01 10:00:00'
+```
+
+The `restore_command` tells PostgreSQL where to find archived WAL files.
+
+The `recovery_target_time` tells PostgreSQL to stop recovery at the specified point in time.
+
+### 4. Start PostgreSQL
+
+```bash
+sudo systemctl start postgresql
+```
+
+PostgreSQL then uses the base backup and archived WAL files to recover the database to the specified recovery point.
+
+### 5. Verify Recovery
+
+I connected to the database:
+
+```bash
+psql bootcamp
+```
+
+I then checked the number of records in the `students` table:
+
+```sql
+SELECT count(*) FROM students;
+```
+
+If the recovery was successful, the student records that existed before the accidental deletion should be restored.
+
+---
+
+# Step 4: Set Up a Streaming Standby
+
+Streaming replication allows a standby PostgreSQL server to continuously receive WAL changes from the primary server.
+
+## 1. Create a Replication Role
+
+On the primary server, I created a replication user:
+
+```sql
+CREATE ROLE replicator
+WITH REPLICATION LOGIN PASSWORD 'reppass';
+```
+
+## 2. Configure pg_hba.conf
+
+I added the following line to `pg_hba.conf`:
+
+```conf
+host replication replicator 127.0.0.1/32 md5
+```
+
+This allows the `replicator` user to connect from the local host for replication.
+
+After changing `pg_hba.conf`, I reloaded PostgreSQL:
+
+```bash
+sudo systemctl reload postgresql
+```
+
+## 3. Build the Standby
+
+I created the standby using `pg_basebackup`:
+
+```bash
+pg_basebackup -h 127.0.0.1 -U replicator -D ~/standby -R -P
+```
+
+The options mean:
+
+- `-h 127.0.0.1` - Connect to the primary server.
+- `-U replicator` - Use the replication user.
+- `-D ~/standby` - Store the standby data directory in `~/standby`.
+- `-R` - Automatically configure the standby for replication.
+- `-P` - Display progress.
+
+---
+
+# Step 5: Watch Replication Health
+
+From the primary PostgreSQL server, I checked the replication status using:
+
+```sql
+SELECT application_name,
+       state,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+```
+
+Example output:
+
+```text
+ application_name |   state   | lag_bytes
+------------------+-----------+-----------
+ standby          | streaming |         0
+```
+
+The `state` column shows the current replication status.
+
+A state of:
+
+```text
+streaming
+```
+
+means that the standby is actively receiving WAL data from the primary.
+
+The `lag_bytes` column shows the approximate amount of WAL data that has been sent but has not yet been replayed by the standby.
+
+---
+
+# Important Commands Used
+
+## Logical Backup
+
+```bash
+mkdir -p ~/backups
+pg_dump -Fc -f ~/backups/bootcamp.dump bootcamp
+pg_restore --list ~/backups/bootcamp.dump | head
+createdb bootcamp_check && pg_restore -d bootcamp_check ~/backups/bootcamp.dump
+```
+
+## WAL Archiving
+
+```bash
+mkdir -p ~/backups/wal
+sudo systemctl restart postgresql
+pg_basebackup -D ~/backups/base -Ft -z -Xs -P
+```
+
+## Point-in-Time Recovery
+
+```sql
+SELECT now();
+
+DELETE FROM students;
+
+SELECT count(*) FROM students;
+```
+
+Recovery configuration:
+
+```conf
+restore_command = 'cp /home/$USER/backups/wal/%f %p'
+recovery_target_time = '2025-06-01 10:00:00'
+```
+
+## Streaming Replication
+
+```sql
+CREATE ROLE replicator
+WITH REPLICATION LOGIN PASSWORD 'reppass';
+```
+
+`pg_hba.conf`:
+
+```conf
+host replication replicator 127.0.0.1/32 md5
+```
+
+Build the standby:
+
+```bash
+pg_basebackup -h 127.0.0.1 -U replicator -D ~/standby -R -P
+```
+
+Check replication:
+
+```sql
+SELECT application_name,
+       state,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+```
+
+---
+
+# Wrap-Up
+
+In this lab, I protected the `bootcamp` PostgreSQL database using several backup and recovery techniques.
+
+First, I created and verified a logical backup using `pg_dump` and `pg_restore`.
+
+Second, I configured WAL archiving and created a base backup using `pg_basebackup`.
+
+Third, I simulated a disaster by deleting records from the `students` table and used Point-in-Time Recovery to restore the database to an earlier point in time.
+
+Finally, I created a replication user, configured PostgreSQL for streaming replication, created a standby server, and monitored the replication status and lag.
+
+This exercise demonstrated how PostgreSQL backups, WAL archiving, Point-in-Time Recovery, and streaming replication can help protect data against accidental deletion and system failures.
